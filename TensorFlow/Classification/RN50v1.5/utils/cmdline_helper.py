@@ -36,7 +36,7 @@ def parse_cmdline():
 
     p.add_argument(
         '--mode',
-        choices=['train', 'train_and_evaluate', 'evaluate', 'training_benchmark', 'inference_benchmark'],
+        choices=['train', 'train_and_evaluate', 'evaluate', 'training_benchmark', 'inference_benchmark', 'train_to_target_accuracy'],
         type=str,
         default='train_and_evaluate',
         required=False,

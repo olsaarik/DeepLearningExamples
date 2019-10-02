@@ -193,13 +193,19 @@ class ResnetModel(object):
 
             with tf.device("/gpu:0"):
 
+                top1_count = tf.Variable(0, name="top1_count", dtype=tf.int32, collections=[tf.GraphKeys.LOCAL_VARIABLES])
+                top1_denom = tf.Variable(0, name="top1_count", dtype=tf.int32, collections=[tf.GraphKeys.LOCAL_VARIABLES])
+
                 if mode == tf.estimator.ModeKeys.TRAIN:
                     acc_top1 = tf.nn.in_top_k(predictions=logits, targets=labels, k=1)
                     acc_top5 = tf.nn.in_top_k(predictions=logits, targets=labels, k=5)
 
                 else:
-                    acc_top1, acc_top1_update_op = tf.metrics.mean(tf.nn.in_top_k(predictions=logits, targets=labels, k=1))
+                    top1 = tf.nn.in_top_k(predictions=logits, targets=labels, k=1)
+                    acc_top1, acc_top1_update_op = tf.metrics.mean(top1)
                     acc_top5, acc_top5_update_op = tf.metrics.mean(tf.nn.in_top_k(predictions=logits, targets=labels, k=5))
+                    top1_count_update_op = tf.assign_add(top1_count, tf.reduce_sum(tf.cast(top1, tf.int32)))
+                    top1_denom_update_op = tf.assign_add(top1_denom, tf.size(top1))
 
                 tf.identity(acc_top1, name="acc_top1_ref")
                 tf.identity(acc_top5, name="acc_top5_ref")
@@ -208,7 +214,9 @@ class ResnetModel(object):
                     'classes': y_preds,
                     'probabilities': probs,
                     'accuracy_top1': acc_top1,
-                    'accuracy_top5': acc_top5
+                    'accuracy_top5': acc_top5,
+                    'top1_count': top1_count,
+                    'top1_denom': top1_denom
                 }
                 if "label_smoothing" in params.keys() and params['label_smoothing'] != 0.0:
                     one_hot_labels = tf.one_hot(labels, 1001)
@@ -279,6 +287,10 @@ class ResnetModel(object):
                         
                         optimizer = hvd.DistributedOptimizer(optimizer)
 
+                    # Enable AMP in TF 1.14
+                    if params["use_tf_amp"]:
+                        optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(optimizer)
+
                     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
                     if mode != tf.estimator.ModeKeys.TRAIN:
                         update_ops += [acc_top1_update_op, acc_top5_update_op]
@@ -301,7 +313,9 @@ class ResnetModel(object):
 
                     eval_metrics = {
                         "top1_accuracy": (acc_top1, acc_top1_update_op),
-                        "top5_accuracy": (acc_top5, acc_top5_update_op)
+                        "top5_accuracy": (acc_top5, acc_top5_update_op),
+                        "top1_count": (top1_count, top1_count_update_op),
+                        "top1_denom": (top1_denom, top1_denom_update_op)
                     }
 
                     return tf.estimator.EstimatorSpec(

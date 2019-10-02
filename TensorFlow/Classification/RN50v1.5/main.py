@@ -139,3 +139,20 @@ if __name__ == "__main__":
                 log_every_n_steps=RUNNING_CONFIG.log_every_n_steps,
                 is_benchmark=RUNNING_CONFIG.mode == 'inference_benchmark'
             )
+
+    if RUNNING_CONFIG.mode == "train_to_target_accuracy":
+        runner.train_and_evaluate(
+            iter_unit=RUNNING_CONFIG.iter_unit,
+            num_iter=RUNNING_CONFIG.num_iter,
+            batch_size=RUNNING_CONFIG.batch_size,
+            warmup_steps=RUNNING_CONFIG.warmup_steps,
+            log_every_n_steps=RUNNING_CONFIG.log_every_n_steps,
+            weight_decay=RUNNING_CONFIG.weight_decay,
+            lr_init=RUNNING_CONFIG.lr_init,
+            lr_warmup_epochs=RUNNING_CONFIG.lr_warmup_epochs,
+            momentum=RUNNING_CONFIG.momentum,
+            loss_scale=RUNNING_CONFIG.loss_scale,
+            label_smoothing=RUNNING_CONFIG.label_smoothing,
+            use_static_loss_scaling=RUNNING_CONFIG.use_static_loss_scaling,
+            use_cosine_lr=RUNNING_CONFIG.use_cosine_lr
+        )

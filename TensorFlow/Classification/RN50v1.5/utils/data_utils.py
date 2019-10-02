@@ -76,7 +76,7 @@ def get_synth_input_fn(batch_size, height, width, num_channels, data_format, num
     return data
 
 
-def get_tfrecords_input_fn(filenames, batch_size, height, width, training, distort_color, num_threads, deterministic):
+def get_tfrecords_input_fn(filenames, batch_size, height, width, training, distort_color, num_threads, deterministic, distribute_validation=False):
 
     shuffle_buffer_size = 4096
 
@@ -90,7 +90,7 @@ def get_tfrecords_input_fn(filenames, batch_size, height, width, training, disto
 
     ds = tf.data.Dataset.from_tensor_slices(filenames)
 
-    if hvd_utils.is_using_hvd() and training:
+    if hvd_utils.is_using_hvd() and (training or distribute_validation):
         ds = ds.shard(hvd.size(), hvd.rank())
 
     ds = ds.apply(
@@ -115,6 +115,8 @@ def get_tfrecords_input_fn(filenames, batch_size, height, width, training, disto
 
         ds = ds.apply(tf.data.experimental.shuffle_and_repeat(buffer_size=shuffle_buffer_size, seed=seed))
 
+    elif distribute_validation:
+        pass
     else:
         ds = ds.repeat()
 

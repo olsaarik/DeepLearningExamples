@@ -425,7 +425,8 @@ class Runner(object):
             'apply_loss_scaling': use_static_loss_scaling,
             'label_smoothing': label_smoothing,
             'num_decay_steps': num_decay_steps,
-            'use_cosine_lr': use_cosine_lr
+            'use_cosine_lr': use_cosine_lr,
+            'use_tf_amp': self.run_hparams.use_tf_amp,
         }
 
         image_classifier = self._get_estimator(
@@ -618,3 +619,239 @@ class Runner(object):
             print("Keyboard interrupt")
 
         LOGGER.log('Ending Model Evaluation ...')
+
+
+    def train_and_evaluate(
+        self,
+        iter_unit,
+        num_iter,
+        batch_size,
+        warmup_steps=50,
+        weight_decay=1e-4,
+        lr_init=0.1,
+        lr_warmup_epochs=5,
+        momentum=0.9,
+        log_every_n_steps=1,
+        loss_scale=256,
+        label_smoothing=0.0,
+        use_cosine_lr=False,
+        use_static_loss_scaling=False
+    ):
+        from mpi4py import MPI
+        from azureml.core import Run
+        run = Run.get_context()
+
+        if self.run_hparams.data_dir is None:
+            raise ValueError('`data_dir` must be specified for training!')
+
+        if self.run_hparams.use_tf_amp or self.run_hparams.dtype == tf.float16:
+            if use_static_loss_scaling:
+                os.environ["TF_ENABLE_AUTO_MIXED_PRECISION_LOSS_SCALING"] = "0"
+            else:
+                LOGGER.log("TF Loss Auto Scaling is activated")
+                os.environ["TF_ENABLE_AUTO_MIXED_PRECISION_LOSS_SCALING"] = "1"
+        else:
+            use_static_loss_scaling = False  # Make sure it hasn't been set to True on FP32 training
+
+        num_gpus = 1 if not hvd_utils.is_using_hvd() else hvd.size()
+        global_batch_size = batch_size * num_gpus
+
+        if self.run_hparams.data_dir is not None:
+            filenames,num_samples, num_steps, num_epochs, num_decay_steps = runner_utils.parse_tfrecords_dataset(
+                data_dir=self.run_hparams.data_dir,
+                mode="train",
+                iter_unit=iter_unit,
+                num_iter=num_iter,
+                global_batch_size=global_batch_size,
+            )
+            validation_filenames, _, _, _, _ = runner_utils.parse_tfrecords_dataset(
+                data_dir=self.run_hparams.data_dir,
+                mode="validation",
+                iter_unit=iter_unit,
+                num_iter=num_iter,
+                global_batch_size=global_batch_size,
+            )
+
+            steps_per_epoch = num_steps / num_epochs
+
+        else:
+            num_epochs = 1
+            num_steps = num_iter
+            steps_per_epoch = num_steps
+            num_decay_steps = num_steps
+            num_samples = num_steps * batch_size
+            
+        training_hooks = []
+      
+        if hvd.rank() == 0:
+            LOGGER.log("Training Epochs", num_epochs)
+            LOGGER.log("Total Steps", num_steps)
+            LOGGER.log("Steps per Epoch", steps_per_epoch)
+            LOGGER.log("Decay Steps", num_decay_steps)
+            LOGGER.log("Weight Decay Factor", weight_decay)
+            LOGGER.log("Init Learning Rate", lr_init)
+            LOGGER.log("Momentum", momentum)
+            LOGGER.log("Num GPUs", num_gpus)
+            LOGGER.log("Per-GPU Batch Size", batch_size)
+            LOGGER.log("Global Batch Size", global_batch_size)
+
+            training_logging_hook = hooks.TrainingLoggingHook(
+                log_file_path=os.path.join(self.run_hparams.log_dir, "training.json"),
+                global_batch_size=global_batch_size,
+                num_steps=num_steps,
+                num_samples=num_samples,
+                num_epochs=num_epochs,
+                log_every=log_every_n_steps
+            )
+
+            azureml_logging_hook = hooks.AzureMLLoggingHook(
+                global_batch_size=global_batch_size,
+                log_every=log_every_n_steps
+            )
+
+            training_hooks.append(training_logging_hook)
+            training_hooks.append(azureml_logging_hook)
+
+        if hvd_utils.is_using_hvd():
+            bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
+            training_hooks.append(bcast_hook)
+
+        training_hooks.append(hooks.PrefillStagingAreasHook())
+    
+        eval_hooks = []
+        
+        if hvd_utils.is_using_hvd():
+            bcast_hook = hvd.BroadcastGlobalVariablesHook(0)
+            eval_hooks.append(bcast_hook)
+        
+        if hvd.rank() == 0:
+            LOGGER.log("Evaluation Epochs", num_epochs)
+            LOGGER.log("Evaluation Steps", num_steps)
+            LOGGER.log("Decay Steps", num_decay_steps)
+      
+        estimator_params = {
+            'batch_size': batch_size,
+            'steps_per_epoch': steps_per_epoch,
+            'num_gpus': num_gpus,
+            'momentum': momentum,
+            'lr_init': lr_init,
+            'lr_warmup_epochs': lr_warmup_epochs,
+            'weight_decay': weight_decay,
+            'loss_scale': loss_scale,
+            'apply_loss_scaling': use_static_loss_scaling,
+            'label_smoothing': label_smoothing,
+            'num_decay_steps': num_decay_steps,
+            'use_cosine_lr': use_cosine_lr,
+            'use_tf_amp': self.run_hparams.use_tf_amp,
+        }
+
+        image_classifier = self._get_estimator(
+            mode='train',
+            run_params=estimator_params,
+            use_xla=self.run_hparams.use_xla,
+            use_dali=self.run_hparams.use_dali,
+            gpu_memory_fraction=self.run_hparams.gpu_memory_fraction
+        )
+
+        image_classifier_eval = self._get_estimator(
+            mode='validation',
+            run_params={},
+            use_xla=self.run_hparams.use_xla,
+            use_dali=self.run_hparams.use_dali,
+            gpu_memory_fraction=self.run_hparams.gpu_memory_fraction
+        )
+
+        def training_data_fn():
+            
+            if self.run_hparams.data_dir is not None:
+
+                return data_utils.get_tfrecords_input_fn(
+                    filenames=filenames,
+                    batch_size=batch_size,
+                    height=self.run_hparams.height,
+                    width=self.run_hparams.width,
+                    training=True,
+                    distort_color=self.run_hparams.distort_colors,
+                    num_threads=self.run_hparams.num_preprocessing_threads,
+                    deterministic=False if self.run_hparams.seed is None else True
+                )
+
+            else:
+                if hvd.rank() == 0:
+                    LOGGER.log("Using Synthetic Data ...")
+                return data_utils.get_synth_input_fn(
+                    batch_size=batch_size,
+                    height=self.run_hparams.height,
+                    width=self.run_hparams.width,
+                    num_channels=self.run_hparams.n_channels,
+                    data_format=self.run_hparams.input_format,
+                    num_classes=self.run_hparams.n_classes,
+                    dtype=self.run_hparams.dtype,
+                )
+
+        def evaluation_data_fn():
+    
+            if self.run_hparams.data_dir is not None:
+                return data_utils.get_tfrecords_input_fn(
+                        filenames=validation_filenames,
+                        batch_size=batch_size,
+                        height=self.run_hparams.height,
+                        width=self.run_hparams.width,
+                        training=False,
+                        distort_color=self.run_hparams.distort_colors,
+                        num_threads=self.run_hparams.num_preprocessing_threads,
+                        deterministic=False if self.run_hparams.seed is None else True,
+                        distribute_validation=True
+                    )
+
+            else:
+                LOGGER.log("Using Synthetic Data ...\n")
+                return data_utils.get_synth_input_fn(
+                    batch_size=batch_size,
+                    height=self.run_hparams.height,
+                    width=self.run_hparams.width,
+                    num_channels=self.run_hparams.n_channels,
+                    data_format=self.run_hparams.input_format,
+                    num_classes=self.run_hparams.n_classes,
+                    dtype=self.run_hparams.dtype,
+                )
+
+
+        try:
+            train_up_to_epoch = 50
+            samples_trained = 0
+            top1_accuracy = 0.0
+            while top1_accuracy < 75.9 and train_up_to_epoch < num_epochs:
+                if hvd.rank() == 0:
+                    LOGGER.log("Training until epoch %i" % train_up_to_epoch)
+                target_samples_this_epoch = num_samples * train_up_to_epoch - samples_trained
+                steps_this_epoch = (target_samples_this_epoch // global_batch_size)
+                image_classifier.train(
+                    input_fn=training_data_fn,
+                    steps=steps_this_epoch,
+                    hooks=training_hooks,
+                )
+                samples_trained += steps_this_epoch * global_batch_size
+                if hvd.rank() == 0:
+                    LOGGER.log('Evaluating at %i epochs' % train_up_to_epoch)
+                eval_results = image_classifier_eval.evaluate(
+                    input_fn=evaluation_data_fn,
+                    steps=None,
+                    hooks=eval_hooks,
+                )
+                top1_count = float(eval_results['top1_count'])
+                top1_denom = float(eval_results['top1_denom'])
+                top1_count = MPI.COMM_WORLD.allreduce(top1_count)
+                top1_denom = MPI.COMM_WORLD.allreduce(top1_denom)
+                top1_accuracy = (top1_count / top1_denom) * 100
+                if hvd.rank() == 0:
+                    LOGGER.log('Global Top-1 Accuracy: %.3f' % (top1_accuracy))
+                    run.log_row(name='Top-1 accuracy', epoch=train_up_to_epoch, acc=top1_accuracy)
+                train_up_to_epoch += 1
+            if hvd.rank() == 0:
+                run.log('Total epochs to reach target accuracy', train_up_to_epoch-1)
+        except KeyboardInterrupt:
+            print("Keyboard interrupt")
+            
+        if hvd.rank() == 0:
+            LOGGER.log('Ending Model Training ...')
